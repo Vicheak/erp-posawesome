@@ -14,6 +14,7 @@ from erpnext.stock.doctype.batch.batch import (
 from frappe import _
 from frappe.utils import cint, cstr, flt, getdate, money_in_words, nowdate, strip_html_tags
 from frappe.utils.background_jobs import enqueue
+from erpnext.stock.utils import get_child_default_warehouse
 
 from posawesome.posawesome.api.payments import (
     redeeming_customer_credit,
@@ -52,14 +53,19 @@ def _apply_item_name_overrides(invoice_doc, overrides=None):
 
 def _get_available_stock(item):
     """Return available stock qty for an item row."""
-    warehouse = item.get("warehouse")
-    batch_no = item.get("batch_no")
     item_code = item.get("item_code")
+    warehouse = item.get("warehouse")
+
+    item_stock_qty, _, default_warehouse = get_stock_availability(item_code, warehouse, return_default_warehouse=True)
+    warehouse = default_warehouse
+
+    batch_no = item.get("batch_no")
+
     if not item_code or not warehouse:
         return 0
     if batch_no:
         return get_batch_qty(batch_no, warehouse) or 0
-    return get_stock_availability(item_code, warehouse)
+    return item_stock_qty or 0
 
 
 def _collect_stock_errors(items):
@@ -422,6 +428,10 @@ def update_invoice(data):
                 sum(p.base_amount for p in invoice_doc.payments)
         )
 
+    # update child default warehouse before save invoice
+    for d in invoice_doc.items:
+        d.warehouse = get_child_default_warehouse(d.item_code, d.warehouse)
+
     invoice_doc.flags.ignore_permissions = True
     frappe.flags.ignore_account_permission = True
     invoice_doc.docstatus = 0
@@ -543,6 +553,10 @@ def submit_invoice(invoice, data):
 
     _validate_stock_on_invoice(invoice_doc)
 
+    # update child default warehouse before save invoice
+    for d in invoice_doc.items:
+        d.warehouse = get_child_default_warehouse(d.item_code, d.warehouse)
+
     invoice_doc.flags.ignore_permissions = True
     frappe.flags.ignore_account_permission = True
     invoice_doc.posa_is_printed = 1
@@ -615,6 +629,10 @@ def submit_in_background_job(kwargs):
     # Add the grand total at the end of remarks
     grand_total = f"\nGrand Total: {invoice_doc.grand_total}"
     items.append(grand_total)
+
+    # update child default warehouse before save invoice
+    for d in invoice_doc.items:
+        d.warehouse = get_child_default_warehouse(d.item_code, d.warehouse)
 
     invoice_doc.remarks = "\n".join(items)
     invoice_doc.save()
@@ -874,6 +892,11 @@ def update_invoice_from_order(data):
     data = json.loads(data)
     invoice_doc = frappe.get_doc("Sales Invoice", data.get("name"))
     invoice_doc.update(data)
+
+    # update child default warehouse before save invoice
+    for d in invoice_doc.items:
+        d.warehouse = get_child_default_warehouse(d.item_code, d.warehouse)
+
     invoice_doc.save()
     return invoice_doc
 

@@ -13,33 +13,34 @@ from frappe import _
 from frappe.utils import cstr, flt, get_datetime, nowdate
 from frappe.utils.background_jobs import enqueue
 from frappe.utils.caching import redis_cache
+from erpnext.accounts.doctype.pos_invoice.pos_invoice import get_stock_availability
 
 from .utils import HAS_VARIANTS_EXCLUSION, get_item_groups
 
 
-def get_stock_availability(item_code, warehouse):
-	"""Return total available quantity for an item in the given warehouse.
+# def get_stock_availability(item_code, warehouse):
+# 	"""Return total available quantity for an item in the given warehouse.
 
-	``warehouse`` can be either a single warehouse or a warehouse group.
-	In case of a group, quantities from all child warehouses are summed up
-	to provide an accurate availability figure.
-	"""
+# 	``warehouse`` can be either a single warehouse or a warehouse group.
+# 	In case of a group, quantities from all child warehouses are summed up
+# 	to provide an accurate availability figure.
+# 	"""
 
-	if not warehouse:
-		return 0.0
+# 	if not warehouse:
+# 		return 0.0
 
-	warehouses = [warehouse]
-	if frappe.db.get_value("Warehouse", warehouse, "is_group"):
-		# Include all child warehouses when a group warehouse is set
-		warehouses = frappe.db.get_descendants("Warehouse", warehouse) or []
+# 	warehouses = [warehouse]
+# 	if frappe.db.get_value("Warehouse", warehouse, "is_group"):
+# 		# Include all child warehouses when a group warehouse is set
+# 		warehouses = frappe.db.get_descendants("Warehouse", warehouse) or []
 
-	rows = frappe.get_all(
-		"Bin",
-		fields=["sum(actual_qty) as actual_qty"],
-		filters={"item_code": item_code, "warehouse": ["in", warehouses]},
-	)
+# 	rows = frappe.get_all(
+# 		"Bin",
+# 		fields=["sum(actual_qty) as actual_qty"],
+# 		filters={"item_code": item_code, "warehouse": ["in", warehouses]},
+# 	)
 
-	return flt(rows[0].actual_qty) if rows else 0.0
+# 	return flt(rows[0].actual_qty) if rows else 0.0
 
 
 @frappe.whitelist()
@@ -69,13 +70,14 @@ def get_available_qty(items):
 
 		if batch_no:
 			available_qty = get_batch_qty(batch_no, warehouse) or 0
+			default_warehouse = warehouse
 		else:
-			available_qty = get_stock_availability(item_code, warehouse)
+			available_qty, _, default_warehouse = get_stock_availability(item_code, warehouse, return_default_warehouse=True)
 
 		result.append(
 			{
 				"item_code": item_code,
-				"warehouse": warehouse,
+				"warehouse": default_warehouse,
 				"available_qty": flt(available_qty),
 			}
 		)
@@ -200,7 +202,9 @@ def get_items(
 
 				# Add item group filter
 				if item_groups:
-					filters["item_group"] = ["in", item_groups]
+					valid_item_groups = [g for g in item_groups if g and g != "All Item Groups"]
+					if valid_item_groups:
+						filters["item_group"] = ["in", valid_item_groups]
 
 				# Add search conditions
 				or_filters = []
@@ -338,11 +342,15 @@ def get_items(
 						):
 							continue
 
+						item_stock_qty, _, default_warehouse = get_stock_availability(item.item_code, warehouse, return_default_warehouse=True)
+
 						row = {}
 						row.update(item)
 						row.update(detail)
 						row.update(
 							{
+								"actual_qty": item_stock_qty,
+								"warehouse": default_warehouse,
 								"attributes": attributes or "",
 								"item_attributes": item_attributes or "",
 							}
@@ -404,17 +412,17 @@ def get_items_groups():
 
 @frappe.whitelist()
 def get_items_count(pos_profile, item_groups=None):
-		pos_profile = json.loads(pos_profile)
-		if isinstance(item_groups, str):
-			try:
-				item_groups = json.loads(item_groups)
-			except Exception:
-				item_groups = []
-		item_groups = item_groups or get_item_groups(pos_profile.get("name"))
-		filters = {"disabled": 0, "is_sales_item": 1, "is_fixed_asset": 0}
-		if item_groups:
-			filters["item_group"] = ["in", item_groups]
-		return frappe.db.count("Item", filters)
+	pos_profile = json.loads(pos_profile)
+	if isinstance(item_groups, str):
+		try:
+			item_groups = json.loads(item_groups)
+		except Exception:
+			item_groups = []
+	item_groups = item_groups or get_item_groups(pos_profile.get("name"))
+	filters = {"disabled": 0, "is_sales_item": 1, "is_fixed_asset": 0}
+	if item_groups:
+		filters["item_group"] = ["in", item_groups]
+	return frappe.db.count("Item", filters)
 
 
 @frappe.whitelist()
@@ -751,6 +759,12 @@ def get_items_details(pos_profile, items_data, price_list=None, customer=None):
 	for d in serial_rows:
 		serial_map.setdefault(d.item_code, []).append({"serial_no": d.serial_no})
 
+	warehouse_map = {}
+	for code in item_codes:
+		item_stock_qty, _, default_warehouse = get_stock_availability(code, warehouse, return_default_warehouse=True)
+		stock_map[code] = item_stock_qty
+		warehouse_map[code] = default_warehouse
+
 	result = []
 	for item in items_data:
 		item_code = item.get("item_code")
@@ -775,6 +789,7 @@ def get_items_details(pos_profile, items_data, price_list=None, customer=None):
 				"item_uoms": uoms or [],
 				"item_barcode": barcode_map.get(item_code, []),
 				"actual_qty": stock_map.get(item_code, 0) or 0,
+				"warehouse": warehouse_map.get(item_code) or warehouse,
 				"has_batch_no": meta.get("has_batch_no"),
 				"has_serial_no": meta.get("has_serial_no"),
 				"batch_no_data": batch_map.get(item_code, []),
@@ -888,7 +903,9 @@ def get_item_detail(item, doc=None, warehouse=None, price_list=None, company=Non
 		overwrite_warehouse=False,
 	)
 	if item.get("is_stock_item") and warehouse:
-		res["actual_qty"] = get_stock_availability(item_code, warehouse)
+		item_stock_qty, _, default_warehouse = get_stock_availability(item_code, warehouse, return_default_warehouse=True)
+		res["actual_qty"] = item_stock_qty
+		res["warehouse"] = default_warehouse
 	res["max_discount"] = max_discount
 	res["batch_no_data"] = batch_no_data
 	res["serial_no_data"] = serial_no_data
